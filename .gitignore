@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.token
+.env
+*.mitm
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+captures/
+
+# Large reverse-engineering artifacts (keep outside git)
+com.engie.particuliers_10.28.0/
+com.engie.particuliers_10.28.0.xapk
+tools/

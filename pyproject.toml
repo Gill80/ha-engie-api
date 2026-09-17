@@ -1,0 +1,25 @@
+[project]
+name = "ha-engie-api"
+version = "0.1.0"
+description = "Python client for ENGIE Particuliers (reverse-engineered from the Android app)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Identity Labs" }]
+dependencies = [
+    "httpx>=0.27.0",
+]
+urls = { Homepage = "https://github.com/Identity-labs/ha-engie-api", Repository = "https://github.com/Identity-labs/ha-engie-api" }
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+engie-particuliers = "engie_particuliers.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
