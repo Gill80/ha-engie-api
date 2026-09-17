@@ -166,6 +166,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub.add_parser("identifiant", help="Fetch Okta identifiant payload")
     sub.add_parser("prices", help="Current €/kWh TTC for each energy contract")
+    sub.add_parser("snapshot", help="Prices, recent daily consumption, and billing")
+    history = sub.add_parser("history", help="Consumption history for one contract")
+    history.add_argument("--energy", default="elec", help="elec or gaz (ignored with --contract-id)")
+    history.add_argument(
+        "--granularity",
+        default="day",
+        choices=["hour", "day", "month"],
+        help="histo grain (hour is electricity only)",
+    )
+    history.add_argument("--days", type=int, default=30, help="Lookback window")
+    history.add_argument("--contract-id", default="", help="Energy contract id (default: first)")
+    sub.add_parser("invoices", help="Invoice list for the primary compte contrat")
+    sub.add_parser("balance", help="Outstanding balance / next invoice date")
 
     args = parser.parse_args(argv)
     token_path = _token_path(args)
@@ -217,6 +230,56 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "prices":
                 prices = client.get_prices()
                 _dump({"contracts": [item.to_dict() for item in prices]})
+            elif args.command == "snapshot":
+                _dump(client.get_snapshot().to_dict())
+            elif args.command == "history":
+                account = client.get_account()
+                partner = account.primary
+                if partner is None or not partner.comptes_contrat:
+                    raise SystemExit("No compte contrat on this account")
+                cc = partner.comptes_contrat[0]
+                code_postal = cc.adresse.cp if cc.adresse else ""
+                contract_id = (args.contract_id or "").strip()
+                if contract_id:
+                    points = client.get_consumption_points_for_contract(
+                        contract_id,
+                        granularity=args.granularity,
+                        days=args.days,
+                        account=account,
+                    )
+                else:
+                    energy = "GAZ" if str(args.energy).lower().startswith("g") else "ELEC"
+                    client.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
+                    points = client.get_consumption_points(
+                        energy,
+                        granularity=args.granularity,
+                        ref_bp=partner.ref_bp,
+                        compte_contrat=cc.numero_cc,
+                        code_postal=code_postal,
+                        days=args.days,
+                    )
+                _dump(
+                    {
+                        "count": len(points),
+                        "points": [item.to_dict() for item in points],
+                    }
+                )
+            elif args.command == "invoices":
+                account = client.get_account()
+                partner = account.primary
+                if partner is None or not partner.comptes_contrat:
+                    raise SystemExit("No compte contrat on this account")
+                cc = partner.comptes_contrat[0]
+                client.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
+                _dump(client.get_invoices(partner.ref_bp, cc.numero_cc))
+            elif args.command == "balance":
+                account = client.get_account()
+                partner = account.primary
+                if partner is None or not partner.comptes_contrat:
+                    raise SystemExit("No compte contrat on this account")
+                cc = partner.comptes_contrat[0]
+                client.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
+                _dump(client.get_balance(partner.ref_bp, cc.numero_cc))
     except EngieError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

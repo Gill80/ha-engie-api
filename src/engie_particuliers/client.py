@@ -29,12 +29,19 @@ from engie_particuliers.exceptions import (
     PasswordExpiredError,
 )
 from engie_particuliers.models import (
+    AccountBalance,
     AccountInfo,
+    AccountSnapshot,
+    BillingSnapshot,
     CompteContrat,
+    ConsumptionPoint,
     ContractPrice,
+    ContractSnapshot,
     EnergyContract,
+    Invoice,
     SessionInfo,
     TariffCadran,
+    parse_engie_datetime,
 )
 
 APP_VERSION = "10.28.0"
@@ -128,6 +135,104 @@ def _latest_priced_row(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return max(usable, key=_sort_key)
 
 
+_HISTORY_PATHS = {
+    ("ELEC", "month"): "/dvmobile-ws/api/private/maConso/v7/histoElecMois",
+    ("GAZ", "month"): "/dvmobile-ws/api/private/maConso/v7/histoGazMois",
+    ("ELEC", "day"): "/dvmobile-ws/api/private/maConso/v3/histoElecJours",
+    ("GAZ", "day"): "/dvmobile-ws/api/private/maConso/v3/histoGazJours",
+    ("ELEC", "hour"): "/dvmobile-ws/api/private/maConso/v4/histoElecHeures",
+}
+
+_DEFAULT_HISTORY_DAYS = {"hour": 3, "day": 400, "month": 400}
+
+
+def _range_ms(
+    days: int | None = None,
+    *,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    granularity: str = "day",
+) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    if end_ms is None:
+        end_ms = int(now.timestamp() * 1000)
+    if start_ms is None:
+        window = days if days is not None else _DEFAULT_HISTORY_DAYS.get(granularity, 400)
+        start_ms = int((now - timedelta(days=window)).timestamp() * 1000)
+    return start_ms, end_ms
+
+
+def _account_id(ref_bp: str, numero_cc: str) -> str:
+    return hashlib.sha256(f"{ref_bp}|{numero_cc}".encode()).hexdigest()[:16]
+
+
+def _normalize_energy(energy: str) -> str:
+    blob = (energy or "").strip().upper()
+    if blob in {"ELEC", "ELECTRICITY", "ELECTRICITE", "ÉLEC", "ÉLECTRICITÉ"}:
+        return "ELEC"
+    if blob in {"GAZ", "GAS"}:
+        return "GAZ"
+    return blob
+
+
+def _normalize_granularity(granularity: str) -> str:
+    blob = (granularity or "day").strip().lower()
+    if blob in {"h", "hour", "hours", "heure", "heures"}:
+        return "hour"
+    if blob in {"m", "month", "months", "mois"}:
+        return "month"
+    return "day"
+
+
+def _consumption_points(
+    payload: dict[str, Any], *, energy: str, granularity: str
+) -> list[ConsumptionPoint]:
+    points = [
+        ConsumptionPoint.from_remote(row, energy=energy, granularity=granularity)
+        for row in _histo_rows(payload, energy)
+    ]
+    points.sort(key=lambda item: item.start or item.end)
+    return points
+
+
+def _latest_consumption(points: list[ConsumptionPoint]) -> ConsumptionPoint | None:
+    usable = [item for item in points if item.kwh is not None]
+    if not usable:
+        return None
+    return max(usable, key=lambda item: item.end or item.start)
+
+
+def _invoices_from_remote(payload: dict[str, Any]) -> list[Invoice]:
+    invoices: list[Invoice] = []
+    seen: set[str] = set()
+    for item in payload.get("listeFactures") or []:
+        parsed = Invoice.from_remote(item if isinstance(item, dict) else None)
+        if parsed is None:
+            continue
+        invoices.append(parsed)
+        if parsed.number:
+            seen.add(parsed.number)
+    last = Invoice.from_remote(
+        payload.get("derniereFacture")
+        if isinstance(payload.get("derniereFacture"), dict)
+        else None
+    )
+    if last is not None and (not last.number or last.number not in seen):
+        invoices.insert(0, last)
+    return invoices
+
+
+def _latest_invoice(invoices: list[Invoice]) -> Invoice | None:
+    if not invoices:
+        return None
+
+    def _key(item: Invoice) -> str:
+        parsed = parse_engie_datetime(item.date or item.due_date)
+        return parsed.isoformat() if parsed else (item.date or item.due_date or item.number)
+
+    return max(invoices, key=_key)
+
+
 def _implied_kwh(row: dict[str, Any]) -> tuple[float | None, float | None]:
     conso = _to_float(row.get("conso"))
     if conso is None or conso <= 0:
@@ -216,6 +321,10 @@ class EngieClient:
         if self._http is not None:
             self._http.close()
         self._http = None
+
+    @property
+    def logged_in(self) -> bool:
+        return bool(self._access_token)
 
     @property
     def session(self) -> SessionInfo:
@@ -387,6 +496,41 @@ class EngieClient:
         )
         return payload if isinstance(payload, dict) else {}
 
+    def get_history(
+        self,
+        energy: str,
+        *,
+        granularity: str = "month",
+        ref_bp: str,
+        compte_contrat: str,
+        communicant: bool = True,
+        code_postal: str = "",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        days: int | None = None,
+    ) -> dict[str, Any]:
+        """GET histoElec/histoGaz for hour, day, or month. Do not pass `pdl`."""
+        kind = _normalize_energy(energy)
+        grain = _normalize_granularity(granularity)
+        path = _HISTORY_PATHS.get((kind, grain))
+        if not path:
+            raise ApiError(400, f"unsupported history {kind}/{grain}")
+        start_ms, end_ms = _range_ms(
+            days, start_ms=start_ms, end_ms=end_ms, granularity=grain
+        )
+        params: dict[str, Any] = {
+            "refBP": ref_bp,
+            "compteContrat": compte_contrat,
+            "startDate": start_ms,
+            "endDate": end_ms,
+        }
+        if grain == "month":
+            params["communicant"] = "true" if communicant else "false"
+        if code_postal and grain != "hour":
+            params["codePostal"] = code_postal
+        payload = self._api_json("GET", path, params=params)
+        return payload if isinstance(payload, dict) else {}
+
     def get_monthly_history(
         self,
         energy: str,
@@ -399,28 +543,141 @@ class EngieClient:
         end_ms: int | None = None,
     ) -> dict[str, Any]:
         """GET histoElecMois / histoGazMois. Do not pass `pdl` (empty payload)."""
-        now = datetime.now(timezone.utc)
-        if end_ms is None:
-            end_ms = int(now.timestamp() * 1000)
-        if start_ms is None:
-            start_ms = int((now - timedelta(days=400)).timestamp() * 1000)
-        kind = energy.upper()
-        path = (
-            "/dvmobile-ws/api/private/maConso/v7/histoElecMois"
-            if kind == "ELEC"
-            else "/dvmobile-ws/api/private/maConso/v7/histoGazMois"
+        return self.get_history(
+            energy,
+            granularity="month",
+            ref_bp=ref_bp,
+            compte_contrat=compte_contrat,
+            communicant=communicant,
+            code_postal=code_postal,
+            start_ms=start_ms,
+            end_ms=end_ms,
         )
-        params: dict[str, Any] = {
-            "communicant": "true" if communicant else "false",
-            "refBP": ref_bp,
-            "compteContrat": compte_contrat,
-            "startDate": start_ms,
-            "endDate": end_ms,
-        }
-        if code_postal:
-            params["codePostal"] = code_postal
-        payload = self._api_json("GET", path, params=params)
+
+    def get_daily_history(
+        self,
+        energy: str,
+        *,
+        ref_bp: str,
+        compte_contrat: str,
+        code_postal: str = "",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        days: int | None = None,
+    ) -> dict[str, Any]:
+        """GET histoElecJours / histoGazJours."""
+        return self.get_history(
+            energy,
+            granularity="day",
+            ref_bp=ref_bp,
+            compte_contrat=compte_contrat,
+            code_postal=code_postal,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            days=days,
+        )
+
+    def get_hourly_history(
+        self,
+        *,
+        ref_bp: str,
+        compte_contrat: str,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        days: int | None = None,
+    ) -> dict[str, Any]:
+        """GET histoElecHeures (electricity only)."""
+        return self.get_history(
+            "ELEC",
+            granularity="hour",
+            ref_bp=ref_bp,
+            compte_contrat=compte_contrat,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            days=days,
+        )
+
+    def get_invoices(self, ref_bp: str, compte_contrat: str) -> dict[str, Any]:
+        """GET /dvmobile-ws/api/private/infolistefacture/listeFacture."""
+        payload = self._api_json(
+            "GET",
+            "/dvmobile-ws/api/private/infolistefacture/listeFacture",
+            params={"refBP": ref_bp, "compteContrat": compte_contrat},
+        )
         return payload if isinstance(payload, dict) else {}
+
+    def get_balance(self, ref_bp: str, compte_contrat: str) -> dict[str, Any]:
+        """GET /dvmobile-ws/api/private/facture/soldeApayerV2."""
+        payload = self._api_json(
+            "GET",
+            "/dvmobile-ws/api/private/facture/soldeApayerV2",
+            params={"refBP": ref_bp, "compteContrat": compte_contrat},
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    def get_consumption_points(
+        self,
+        energy: str,
+        *,
+        granularity: str = "day",
+        ref_bp: str,
+        compte_contrat: str,
+        code_postal: str = "",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        days: int | None = None,
+        preferred_communicant: bool | None = None,
+    ) -> list[ConsumptionPoint]:
+        """Typed histo rows for Energy-dashboard import and CLI dumps."""
+        kind = _normalize_energy(energy)
+        grain = _normalize_granularity(granularity)
+        if grain == "month":
+            payload = self._history_with_fallback(
+                kind,
+                granularity=grain,
+                ref_bp=ref_bp,
+                compte_contrat=compte_contrat,
+                code_postal=code_postal,
+                preferred_communicant=preferred_communicant,
+                start_ms=start_ms,
+                end_ms=end_ms,
+                days=days,
+            )
+        else:
+            payload = self._try_json(
+                lambda: self.get_history(
+                    kind,
+                    granularity=grain,
+                    ref_bp=ref_bp,
+                    compte_contrat=compte_contrat,
+                    code_postal=code_postal,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    days=days,
+                )
+            )
+        return _consumption_points(payload, energy=kind, granularity=grain)
+
+    def get_consumption_points_for_contract(
+        self,
+        contract_id: str,
+        *,
+        granularity: str = "day",
+        days: int | None = None,
+        account: AccountInfo | None = None,
+    ) -> list[ConsumptionPoint]:
+        """Resolve a contract id then fetch histo for that energy."""
+        partner, cc, contract = self._find_contract(contract_id, account)
+        self.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
+        code_postal = cc.adresse.cp if cc.adresse else ""
+        return self.get_consumption_points(
+            _energy_kind(contract),
+            granularity=granularity,
+            ref_bp=partner.ref_bp,
+            compte_contrat=cc.numero_cc,
+            code_postal=code_postal,
+            days=days,
+        )
 
     def get_prices(self, account: AccountInfo | None = None) -> list[ContractPrice]:
         """Current €/kWh TTC for every energy contract on the account.
@@ -480,6 +737,86 @@ class EngieClient:
             )
             for contract in cc.contrats
         ]
+
+    def get_snapshot(
+        self,
+        account: AccountInfo | None = None,
+        *,
+        daily_days: int = 14,
+    ) -> AccountSnapshot:
+        """Prices, recent daily consumption, invoices, and outstanding balance."""
+        if account is None:
+            account = self.get_account()
+        contracts: list[ContractSnapshot] = []
+        billing: list[BillingSnapshot] = []
+        for partner in account.partners:
+            for cc in partner.comptes_contrat:
+                prices = self._prices_for_compte(partner.ref_bp, partner.id_personne, cc)
+                code_postal = cc.adresse.cp if cc.adresse else ""
+                kinds = {_energy_kind(contract) for contract in cc.contrats}
+                daily_by_energy: dict[str, list[ConsumptionPoint]] = {}
+                for energy in ("ELEC", "GAZ"):
+                    if energy not in kinds:
+                        continue
+                    daily_by_energy[energy] = self.get_consumption_points(
+                        energy,
+                        granularity="day",
+                        ref_bp=partner.ref_bp,
+                        compte_contrat=cc.numero_cc,
+                        code_postal=code_postal,
+                        days=daily_days,
+                    )
+                invoices_payload = self._try_json(
+                    lambda ref_bp=partner.ref_bp, numero=cc.numero_cc: self.get_invoices(
+                        ref_bp, numero
+                    )
+                )
+                invoices = _invoices_from_remote(invoices_payload)
+                last_invoice = Invoice.from_remote(
+                    invoices_payload.get("derniereFacture")
+                    if isinstance(invoices_payload.get("derniereFacture"), dict)
+                    else None
+                ) or _latest_invoice(invoices)
+                balance = AccountBalance.from_remote(
+                    self._try_json(
+                        lambda ref_bp=partner.ref_bp, numero=cc.numero_cc: self.get_balance(
+                            ref_bp, numero
+                        )
+                    )
+                )
+                billing.append(
+                    BillingSnapshot(
+                        account_id=_account_id(partner.ref_bp, cc.numero_cc),
+                        balance=balance,
+                        last_invoice=last_invoice,
+                        invoice_count=len(invoices),
+                    )
+                )
+                for price in prices:
+                    recent = daily_by_energy.get(price.energy) or []
+                    contracts.append(
+                        ContractSnapshot(
+                            price=price,
+                            last_day=_latest_consumption(recent),
+                            recent_days=recent,
+                        )
+                    )
+        return AccountSnapshot(contracts=contracts, billing=billing)
+
+    def _find_contract(
+        self, contract_id: str, account: AccountInfo | None = None
+    ) -> tuple[Any, CompteContrat, EnergyContract]:
+        wanted = (contract_id or "").strip()
+        if not wanted:
+            raise ApiError(400, "missing contract id")
+        if account is None:
+            account = self.get_account()
+        for partner in account.partners:
+            for cc in partner.comptes_contrat:
+                for contract in cc.contrats:
+                    if contract.id == wanted:
+                        return partner, cc, contract
+        raise ApiError(404, f"unknown contract {wanted}")
 
     def _price_for_contract(
         self,
@@ -599,6 +936,10 @@ class EngieClient:
         compte_contrat: str,
         code_postal: str = "",
         preferred_communicant: bool | None = None,
+        granularity: str = "month",
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        days: int | None = None,
     ) -> dict[str, Any]:
         if preferred_communicant is None:
             flags = (True, False)
@@ -607,12 +948,16 @@ class EngieClient:
         payloads: list[dict[str, Any]] = []
         for communicant in flags:
             payload = self._try_json(
-                lambda communicant=communicant: self.get_monthly_history(
+                lambda communicant=communicant: self.get_history(
                     energy,
+                    granularity=granularity,
                     ref_bp=ref_bp,
                     compte_contrat=compte_contrat,
                     communicant=communicant,
                     code_postal=code_postal,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    days=days,
                 )
             )
             payloads.append(payload)

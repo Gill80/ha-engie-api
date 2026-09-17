@@ -13,12 +13,18 @@ from engie_particuliers.exceptions import (
     PasswordExpiredError,
 )
 from engie_particuliers.models import (
+    AccountBalance,
     AccountInfo,
+    AccountSnapshot,
     Address,
+    BillingSnapshot,
     BusinessPartner,
     CompteContrat,
+    ConsumptionPoint,
     ContractPrice,
+    ContractSnapshot,
     EnergyContract,
+    Invoice,
     SessionInfo,
     TariffCadran,
 )
@@ -42,6 +48,12 @@ __all__ = [
     "Address",
     "ContractPrice",
     "TariffCadran",
+    "AccountSnapshot",
+    "BillingSnapshot",
+    "ContractSnapshot",
+    "ConsumptionPoint",
+    "Invoice",
+    "AccountBalance",
 ]
 
 

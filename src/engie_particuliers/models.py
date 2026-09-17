@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -255,4 +256,207 @@ class ContractPrice:
             "unit": self.unit,
             "abonnement_ttc": self.abonnement_ttc,
             "notes": self.notes,
+        }
+
+
+def parse_engie_datetime(value: Any) -> datetime | None:
+    """Parse ENGIE date fields (ISO, FR slash dates, or epoch ms)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        raw = float(value)
+        if raw > 10_000_000_000:
+            raw /= 1000.0
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return parse_engie_datetime(int(text))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        parsed = None
+    if parsed is not None:
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _iso(value: datetime | None) -> str:
+    return value.isoformat() if value is not None else ""
+
+
+def _to_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_bool(value: Any) -> bool | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
+
+
+@dataclass
+class ConsumptionPoint:
+    """One histoElec/histoGaz row (hour, day, or month)."""
+
+    energy: str
+    granularity: str
+    start: str = ""
+    end: str = ""
+    kwh: float | None = None
+    cost_ttc: float | None = None
+    cost_ht: float | None = None
+    abonnement_ttc: float | None = None
+    temperature: float | None = None
+
+    @classmethod
+    def from_remote(
+        cls, row: dict[str, Any], *, energy: str, granularity: str
+    ) -> ConsumptionPoint:
+        start = parse_engie_datetime(row.get("dateDebut") or row.get("valeurDate"))
+        end = parse_engie_datetime(row.get("dateFin") or row.get("valeurDate"))
+        return cls(
+            energy=energy,
+            granularity=granularity,
+            start=_iso(start),
+            end=_iso(end),
+            kwh=_to_float(row.get("conso")),
+            cost_ttc=_to_float(row.get("consoEuroTTC")),
+            cost_ht=_to_float(row.get("consoEuroHT")),
+            abonnement_ttc=_to_float(row.get("abonnementTTC")),
+            temperature=_to_float(row.get("temperature")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Invoice:
+    number: str = ""
+    date: str = ""
+    due_date: str = ""
+    amount_ttc: float | None = None
+    label: str = ""
+    payment_status: str = ""
+
+    @classmethod
+    def from_remote(cls, data: dict[str, Any] | None) -> Invoice | None:
+        if not isinstance(data, dict) or not data:
+            return None
+        number = data.get("numeroFacture")
+        invoice = cls(
+            number="" if number is None else str(number),
+            date=str(data.get("dateFacture") or ""),
+            due_date=str(data.get("dateEcheance") or ""),
+            amount_ttc=_to_float(data.get("montantTTC")),
+            label=str(data.get("libelle") or ""),
+            payment_status=str(data.get("statutPaiement") or ""),
+        )
+        if not (
+            invoice.number
+            or invoice.date
+            or invoice.due_date
+            or invoice.amount_ttc is not None
+        ):
+            return None
+        return invoice
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class AccountBalance:
+    solde: float | None = None
+    solde_hors_ce: float | None = None
+    solde_ce: float | None = None
+    next_invoice_date: str = ""
+    energie_coupee: bool | None = None
+    recouvrement: bool | None = None
+    paiement_cb: bool | None = None
+
+    @classmethod
+    def from_remote(cls, data: dict[str, Any] | None) -> AccountBalance:
+        if not isinstance(data, dict):
+            return cls()
+        return cls(
+            solde=_to_float(data.get("solde")),
+            solde_hors_ce=_to_float(data.get("soldeHorsCE")),
+            solde_ce=_to_float(data.get("soldeCE")),
+            next_invoice_date=str(data.get("dateProchaineFacture") or ""),
+            energie_coupee=_to_bool(data.get("energieCoupee")),
+            recouvrement=_to_bool(data.get("recouvrement")),
+            paiement_cb=_to_bool(data.get("paiementCB")),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class BillingSnapshot:
+    """Invoices + outstanding balance for one compte contrat."""
+
+    account_id: str
+    balance: AccountBalance = field(default_factory=AccountBalance)
+    last_invoice: Invoice | None = None
+    invoice_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "account_id": self.account_id,
+            "balance": self.balance.to_dict(),
+            "last_invoice": _as_dict(self.last_invoice),
+            "invoice_count": self.invoice_count,
+        }
+
+
+@dataclass
+class ContractSnapshot:
+    """Current tariff plus the latest billed day for one energy contract."""
+
+    price: ContractPrice
+    last_day: ConsumptionPoint | None = None
+    recent_days: list[ConsumptionPoint] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "price": self.price.to_dict(),
+            "last_day": _as_dict(self.last_day),
+            "recent_days": [_as_dict(item) for item in self.recent_days],
+        }
+
+
+@dataclass
+class AccountSnapshot:
+    """Coordinator payload: prices, recent consumption, and billing."""
+
+    contracts: list[ContractSnapshot] = field(default_factory=list)
+    billing: list[BillingSnapshot] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "contracts": [_as_dict(item) for item in self.contracts],
+            "billing": [_as_dict(item) for item in self.billing],
         }
