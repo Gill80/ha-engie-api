@@ -112,15 +112,15 @@ See `reverse/NOTES.md` for the RE summary.
 Bump `version` in `pyproject.toml`, then push a matching tag:
 
 ```bash
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 The [publish](.github/workflows/publish.yml) workflow builds the wheel and sdist, creates a GitHub Release with those artifacts, and uploads them to PyPI.
 
 ## Limitations
 
-- Unofficial API — may break on app updates
+- Daily `histoElecJours` / `histoGazJours` is Linky **D+1** (yesterday). Half-hourly `histoElecHeures` is often **D+2**. The current civil day is not in those APIs; a partial today row is added only if hourly slots exist for today.
 - Some accounts require Okta MFA
 - `estimationConsoElecMois` / `estimationConsoGazMois` (per-cadran HP/HC) can return 403; electricity then uses `ecoGestesDynamiques.prixKwh`, gas uses latest billed month `consoEuroTTC / conso` (variable, excluding subscription)
 - Token refresh re-issues the client-id cookie

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+PARIS = ZoneInfo("Europe/Paris")
 
 
 def _as_dict(value: Any) -> Any:
@@ -280,13 +283,30 @@ def parse_engie_datetime(value: Any) -> datetime | None:
     except ValueError:
         parsed = None
     if parsed is not None:
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        if parsed.tzinfo:
+            return parsed
+        # Date-only ISO ("2026-09-17") is a French civil day, not UTC midnight.
+        if len(text) <= 10:
+            return parsed.replace(tzinfo=PARIS)
+        return parsed.replace(tzinfo=timezone.utc)
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
         try:
-            return datetime.strptime(text[:19], fmt).replace(tzinfo=timezone.utc)
+            return datetime.strptime(text[:10], fmt).replace(tzinfo=PARIS)
+        except ValueError:
+            continue
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(text[:19], fmt).replace(tzinfo=PARIS)
         except ValueError:
             continue
     return None
+
+
+def civil_day_bounds(value: datetime) -> tuple[datetime, datetime]:
+    """Paris midnight → next midnight for the calendar date ENGIE put on the row."""
+    labeled = value.astimezone(timezone.utc).date() if value.tzinfo else value.date()
+    start = datetime(labeled.year, labeled.month, labeled.day, tzinfo=PARIS)
+    return start, start + timedelta(days=1)
 
 
 def _iso(value: datetime | None) -> str:
@@ -328,13 +348,18 @@ class ConsumptionPoint:
     cost_ht: float | None = None
     abonnement_ttc: float | None = None
     temperature: float | None = None
+    partial: bool = False
 
     @classmethod
     def from_remote(
         cls, row: dict[str, Any], *, energy: str, granularity: str
     ) -> ConsumptionPoint:
-        start = parse_engie_datetime(row.get("dateDebut") or row.get("valeurDate"))
-        end = parse_engie_datetime(row.get("dateFin") or row.get("valeurDate"))
+        raw_start = parse_engie_datetime(row.get("dateDebut") or row.get("valeurDate"))
+        raw_end = parse_engie_datetime(row.get("dateFin") or row.get("valeurDate"))
+        if granularity == "day" and raw_start is not None:
+            start, end = civil_day_bounds(raw_start)
+        else:
+            start, end = raw_start, raw_end
         return cls(
             energy=energy,
             granularity=granularity,
@@ -438,12 +463,14 @@ class ContractSnapshot:
 
     price: ContractPrice
     last_day: ConsumptionPoint | None = None
+    today: ConsumptionPoint | None = None
     recent_days: list[ConsumptionPoint] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "price": self.price.to_dict(),
             "last_day": _as_dict(self.last_day),
+            "today": _as_dict(self.today),
             "recent_days": [_as_dict(item) for item in self.recent_days],
         }
 

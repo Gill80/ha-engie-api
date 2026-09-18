@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ from engie_particuliers.client import (
     factor_needs_challenge,
 )
 from engie_particuliers.exceptions import ApiError, EngieError, MfaRequiredError
-from engie_particuliers.models import SessionInfo
+from engie_particuliers.models import PARIS, SessionInfo, parse_engie_datetime
 
 DEFAULT_TOKEN_FILE = ".token"
 
@@ -60,6 +61,34 @@ def _env(name: str) -> str:
 
 def _dump(payload: Any) -> None:
     print(json.dumps(payload, indent=2, default=str, ensure_ascii=False))
+
+
+def _history_meta(points: list[Any]) -> dict[str, Any]:
+    today = datetime.now(PARIS).date()
+    complete = [
+        item
+        for item in points
+        if getattr(item, "kwh", None) is not None and not getattr(item, "partial", False)
+    ]
+    last = complete[-1] if complete else None
+    last_day = None
+    lag_days = None
+    if last is not None:
+        parsed = parse_engie_datetime(getattr(last, "start", None))
+        if parsed is not None:
+            last_day = parsed.astimezone(PARIS).date().isoformat()
+            lag_days = (today - parsed.astimezone(PARIS).date()).days
+    return {
+        "as_of": today.isoformat(),
+        "last_complete_day": last_day,
+        "lag_days": lag_days,
+        "note": (
+            "ENGIE daily histo is Linky D+1 (half-hourly often D+2); "
+            "the current civil day is not published yet."
+            if lag_days
+            else None
+        ),
+    }
 
 
 def _format_factor(index: int, factor: dict[str, Any]) -> str:
@@ -258,12 +287,13 @@ def main(argv: list[str] | None = None) -> int:
                         code_postal=code_postal,
                         days=args.days,
                     )
-                _dump(
-                    {
-                        "count": len(points),
-                        "points": [item.to_dict() for item in points],
-                    }
-                )
+                payload = {
+                    "count": len(points),
+                    "points": [item.to_dict() for item in points],
+                }
+                if str(args.granularity) == "day":
+                    payload.update(_history_meta(points))
+                _dump(payload)
             elif args.command == "invoices":
                 account = client.get_account()
                 partner = account.primary

@@ -41,6 +41,7 @@ from engie_particuliers.models import (
     Invoice,
     SessionInfo,
     TariffCadran,
+    PARIS,
     parse_engie_datetime,
 )
 
@@ -195,8 +196,19 @@ def _consumption_points(
     return points
 
 
-def _latest_consumption(points: list[ConsumptionPoint]) -> ConsumptionPoint | None:
+def _point_civil_date(point: ConsumptionPoint) -> Any:
+    parsed = parse_engie_datetime(point.start)
+    if parsed is None:
+        return None
+    return parsed.astimezone(PARIS).date()
+
+
+def _latest_consumption(
+    points: list[ConsumptionPoint], *, complete_only: bool = False
+) -> ConsumptionPoint | None:
     usable = [item for item in points if item.kwh is not None]
+    if complete_only:
+        usable = [item for item in usable if not item.partial]
     if not usable:
         return None
     return max(usable, key=lambda item: item.end or item.start)
@@ -656,7 +668,66 @@ class EngieClient:
                     days=days,
                 )
             )
-        return _consumption_points(payload, energy=kind, granularity=grain)
+        points = _consumption_points(payload, energy=kind, granularity=grain)
+        if grain == "day":
+            points = self._with_intraday_day(
+                points,
+                energy=kind,
+                ref_bp=ref_bp,
+                compte_contrat=compte_contrat,
+            )
+        return points
+
+    def _with_intraday_day(
+        self,
+        daily: list[ConsumptionPoint],
+        *,
+        energy: str,
+        ref_bp: str,
+        compte_contrat: str,
+    ) -> list[ConsumptionPoint]:
+        """Linky daily histo is D+1. Attach a partial today row from hourly when present.
+
+        Half-hourly is often D+2, so this usually adds nothing — kept so same-day
+        slots are used the moment ENGIE publishes them.
+        """
+        if energy != "ELEC":
+            return daily
+        today = datetime.now(PARIS).date()
+        covered = {_point_civil_date(item) for item in daily}
+        if today in covered:
+            return daily
+        payload = self._try_json(
+            lambda: self.get_hourly_history(
+                ref_bp=ref_bp, compte_contrat=compte_contrat, days=2
+            )
+        )
+        hours = _consumption_points(payload, energy="ELEC", granularity="hour")
+        today_hours = [
+            item
+            for item in hours
+            if item.kwh is not None and _point_civil_date(item) == today
+        ]
+        if not today_hours:
+            return daily
+        kwh = sum(float(item.kwh or 0) for item in today_hours)
+        cost_ttc = sum(float(item.cost_ttc or 0) for item in today_hours)
+        cost_ht = sum(float(item.cost_ht or 0) for item in today_hours)
+        start = datetime(today.year, today.month, today.day, tzinfo=PARIS)
+        daily.append(
+            ConsumptionPoint(
+                energy="ELEC",
+                granularity="day",
+                start=start.isoformat(),
+                end=(start + timedelta(days=1)).isoformat(),
+                kwh=round(kwh, 3),
+                cost_ttc=round(cost_ttc, 2) if cost_ttc else None,
+                cost_ht=round(cost_ht, 2) if cost_ht else None,
+                partial=True,
+            )
+        )
+        daily.sort(key=lambda item: item.start or item.end)
+        return daily
 
     def get_consumption_points_for_contract(
         self,
@@ -797,7 +868,11 @@ class EngieClient:
                     contracts.append(
                         ContractSnapshot(
                             price=price,
-                            last_day=_latest_consumption(recent),
+                            last_day=_latest_consumption(recent, complete_only=True),
+                            today=next(
+                                (item for item in reversed(recent) if item.partial),
+                                None,
+                            ),
                             recent_days=recent,
                         )
                     )
