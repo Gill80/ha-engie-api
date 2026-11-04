@@ -109,8 +109,10 @@ def test_pce_source_returns_gas_readings_and_preserves_contract_ids():
         assert points[0].kwh == 10
         assert any(path.endswith("/histoGazJours") and cc == "ACTIVE_METER"
                    for path, cc in observed)
-        assert any(path.endswith("/histoGazJours") and cc == "OLD_GAS_METER"
-                   for path, cc in observed)
+        # With an explicitly matched meter, avoid querying the stale
+        # account's daily gas history at all.
+        assert not any(path.endswith("/histoGazJours") and cc == "OLD_GAS_METER"
+                       for path, cc in observed)
     finally:
         client.close()
 
