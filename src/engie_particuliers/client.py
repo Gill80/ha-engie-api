@@ -465,11 +465,11 @@ class EngieClient:
         return AccountInfo.from_remote(payload)
 
     def get_contracts(self, ref_bp: str, compte_contrat: str) -> dict[str, Any]:
-        """GET /dvmobile-ws/api/private/espaceClient/getInfoContrats."""
+        """GET /dvmobile-ws/api/private/espaceClient/v2/getInfoContrats."""
         self._require_logged_in()
         payload = self._api_json(
             "GET",
-            "/dvmobile-ws/api/private/espaceClient/getInfoContrats",
+            "/dvmobile-ws/api/private/espaceClient/v2/getInfoContrats",
             params={"refBP": ref_bp, "compteContrat": compte_contrat},
         )
         if not isinstance(payload, dict):
