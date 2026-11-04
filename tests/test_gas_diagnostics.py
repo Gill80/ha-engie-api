@@ -171,3 +171,23 @@ def test_missing_price_does_not_invent_http_status():
     assert electricity.price_kwh_ttc is None
     assert "electricity" in electricity.notes
     assert "gas" not in electricity.notes
+
+
+def test_contract_details_use_v2_endpoint_from_engie_android_10_31():
+    """Only verifies the URL shape; the request never reaches ENGIE."""
+    observed = []
+
+    def handler(request):
+        observed.append(request.url.path)
+        return httpx.Response(200, json={"contrats": []})
+
+    client = _client(handler)
+    try:
+        result = client.get_contracts("synthetic-bp", "synthetic-cc")
+        assert result == {"contrats": []}
+        assert observed == [
+            "/dvmobile-ws/api/private/espaceClient/v2/getInfoContrats"
+        ]
+    finally:
+        client.close()
+
