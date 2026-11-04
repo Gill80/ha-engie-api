@@ -978,6 +978,8 @@ class EngieClient:
                         code_postal=source_postal,
                         days=daily_days,
                     )
+                # Restore nominal account context for invoices and balances.
+                self.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
                 invoices_payload = self._try_json(
                     lambda ref_bp=partner.ref_bp, numero=cc.numero_cc: self.get_invoices(
                         ref_bp, numero
