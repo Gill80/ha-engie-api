@@ -118,6 +118,43 @@ git push origin v0.2.1
 
 The [publish](.github/workflows/publish.yml) workflow builds the wheel and sdist, creates a GitHub Release with those artifacts, and uploads them to PyPI.
 
+## Troubleshooting gas responses (Gill80 fork)
+
+The gas endpoints may return an HTTP error, an empty response, or a valid
+response whose structure is not recognized by the current parser. The
+original client swallowed API errors and sometimes displayed a misleading
+hard-coded `403` message. This fork records a **bounded, in-memory**
+technical summary for three endpoints:
+
+- `estimationConsoGazMois` — monthly gas price estimation
+- `histoGazMois` — monthly gas consumption and costs
+- `histoGazJours` — daily gas consumption
+
+After running a snapshot, inspect `client.gas_api_diagnostics`. Each
+endpoint contains at most six recent attempts with the HTTP code,
+response format, recognized field names, number of history rows, and
+the `communicant` boolean when applicable. A response with a nested
+`data` object is currently **diagnosed**, not automatically decoded;
+we should only change the parser after confirming the actual format.
+
+The summaries contain **no request URLs, identifiers, credentials,
+tokens, cookies, complete JSON responses, individual consumption
+values, or invoice amounts**. Do not enable HTTP debug/trace logging,
+which may reveal authentication material. Diagnostic records are lost
+when the client restarts.
+
+Tests use synthetic fixture data only and never contact ENGIE:
+
+```bash
+python -m pip install -e ".[dev]"
+python -m pytest -q
+```
+
+**This branch alone does not change an existing Home Assistant
+installation.** Deploying it requires a separate, deliberate packaging
+and integration test. The Home Assistant fork can show these summaries
+in its diagnostics once it is connected to this fork of the library.
+
 ## Limitations
 
 - Daily `histoElecJours` / `histoGazJours` is Linky **D+1** (yesterday). Half-hourly `histoElecHeures` is often **D+2**. The current civil day is not in those APIs; a partial today row is added only if hourly slots exist for today.
