@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -145,6 +146,22 @@ _HISTORY_PATHS = {
 }
 
 _DEFAULT_HISTORY_DAYS = {"hour": 3, "day": 400, "month": 400}
+
+# Keep diagnostics limited to API schema names and technical response metadata.
+# In particular, never retain URLs, query parameters, tokens or response values.
+_GAS_API_ENDPOINTS = frozenset({
+    "estimationConsoGazMois", "histoGazMois", "histoGazJours",
+})
+_GAS_SAFE_TOP_LEVEL_FIELDS = frozenset({
+    "historiquesGaz", "historiqueGaz", "historique", "consommations",
+    "data", "result", "content", "prixKwh", "prixMois",
+    "cadrans", "error", "status", "message",
+})
+_GAS_SAFE_ROW_FIELDS = frozenset({
+    "conso", "consoEuroTTC", "consoEuroHT", "abonnementTTC",
+    "dateDebut", "dateFin", "valeurDate", "consommation",
+    "consommationKwh", "volumeM3", "m3",
+})
 
 
 def _range_ms(
@@ -309,6 +326,57 @@ class EngieClient:
         self._scope: str = ""
         self._oidc: Optional[dict[str, Any]] = None
         self._pending_mfa: Optional[dict[str, Any]] = None
+        self._gas_api_diagnostics: dict[str, list[dict[str, Any]]] = {}
+        self._gas_pce_sha256: str = ""
+
+    def set_gas_pce_sha256(self, digest: str | None) -> None:
+        """Select the actual gas meter by a locally configured PCE digest.
+
+        The plain PCE is never kept by the client or sent in diagnostics.
+        Selection only takes effect when there is exactly one gas contract.
+        """
+        value = (digest or "").strip().lower()
+        if value and (len(value) != 64 or any(ch not in "0123456789abcdef" for ch in value)):
+            raise ValueError("Invalid gas PCE SHA-256 digest")
+        self._gas_pce_sha256 = value
+
+    def _gas_source_for_account(
+        self, account: AccountInfo
+    ) -> tuple[Any, CompteContrat] | None:
+        """Resolve the meter matched by PCE, including electricity-listed accounts.
+
+        ENGIE can expose the active gas meter under a contract account whose
+        listeContrat mentions only electricity. Never guess for multi-gas
+        accounts or when the PCE is absent/ambiguous.
+        """
+        if not self._gas_pce_sha256:
+            return None
+        gas_contracts = [
+            contract
+            for partner in account.partners
+            for cc in partner.comptes_contrat
+            for contract in cc.contrats
+            if _energy_kind(contract) == "GAZ"
+        ]
+        if len(gas_contracts) != 1:
+            return None
+        matches: list[tuple[Any, CompteContrat]] = []
+        for partner in account.partners:
+            for cc in partner.comptes_contrat:
+                if not partner.ref_bp or not cc.numero_cc:
+                    continue
+                self.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
+                releve = self._try_json(
+                    lambda ref=partner.ref_bp, number=cc.numero_cc: self.get_releve(ref, number)
+                )
+                meter = _releve_contract(releve, "GAZ")
+                meter_id = "".join(ch for ch in str(meter.get("idPDL") or "") if ch.isdigit())
+                if not (10 <= len(meter_id) <= 17):
+                    continue
+                hashed = hashlib.sha256(meter_id.encode("ascii")).hexdigest()
+                if hmac.compare_digest(hashed, self._gas_pce_sha256):
+                    matches.append((partner, cc))
+        return matches[0] if len(matches) == 1 else None
 
     def set_credentials(self, username: str, password: str) -> None:
         self._username = username.strip()
@@ -337,6 +405,18 @@ class EngieClient:
     @property
     def logged_in(self) -> bool:
         return bool(self._access_token)
+
+    @property
+    def gas_api_diagnostics(self) -> dict[str, list[dict[str, Any]]]:
+        """Technical gas response summaries, safe for Home Assistant diagnostics.
+
+        The last six attempts per endpoint are kept in memory only. No API
+        response values, URLs, authentication details or account IDs are stored.
+        """
+        return {
+            endpoint: [dict(attempt) for attempt in attempts]
+            for endpoint, attempts in self._gas_api_diagnostics.items()
+        }
 
     @property
     def session(self) -> SessionInfo:
@@ -436,11 +516,11 @@ class EngieClient:
         return AccountInfo.from_remote(payload)
 
     def get_contracts(self, ref_bp: str, compte_contrat: str) -> dict[str, Any]:
-        """GET /dvmobile-ws/api/private/espaceClient/getInfoContrats."""
+        """GET /dvmobile-ws/api/private/espaceClient/v2/getInfoContrats."""
         self._require_logged_in()
         payload = self._api_json(
             "GET",
-            "/dvmobile-ws/api/private/espaceClient/getInfoContrats",
+            "/dvmobile-ws/api/private/espaceClient/v2/getInfoContrats",
             params={"refBP": ref_bp, "compteContrat": compte_contrat},
         )
         if not isinstance(payload, dict):
@@ -738,7 +818,13 @@ class EngieClient:
         account: AccountInfo | None = None,
     ) -> list[ConsumptionPoint]:
         """Resolve a contract id then fetch histo for that energy."""
+        if account is None:
+            account = self.get_account()
         partner, cc, contract = self._find_contract(contract_id, account)
+        if _energy_kind(contract) == "GAZ":
+            source = self._gas_source_for_account(account)
+            if source is not None:
+                partner, cc = source
         self.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
         code_postal = cc.adresse.cp if cc.adresse else ""
         return self.get_consumption_points(
@@ -760,13 +846,24 @@ class EngieClient:
         if account is None:
             account = self.get_account()
         prices: list[ContractPrice] = []
+        gas_source = self._gas_source_for_account(account)
         for partner in account.partners:
             for cc in partner.comptes_contrat:
-                prices.extend(self._prices_for_compte(partner.ref_bp, partner.id_personne, cc))
+                prices.extend(
+                    self._prices_for_compte(
+                        partner.ref_bp, partner.id_personne, cc,
+                        gas_source=gas_source,
+                    )
+                )
         return prices
 
     def _prices_for_compte(
-        self, ref_bp: str, id_personne: str, cc: CompteContrat
+        self,
+        ref_bp: str,
+        id_personne: str,
+        cc: CompteContrat,
+        *,
+        gas_source: tuple[Any, CompteContrat] | None = None,
     ) -> list[ContractPrice]:
         self.select_account(ref_bp, cc.numero_cc, id_personne)
         code_postal = cc.adresse.cp if cc.adresse else ""
@@ -798,7 +895,7 @@ class EngieClient:
                 code_postal=code_postal,
                 preferred_communicant=preferred,
             )
-        return [
+        prices = [
             self._price_for_contract(
                 contract,
                 eco=eco,
@@ -808,6 +905,35 @@ class EngieClient:
             )
             for contract in cc.contrats
         ]
+        if gas_source is not None:
+            source_partner, source_cc = gas_source
+            if source_cc is not cc and any(
+                _energy_kind(contract) == "GAZ" for contract in cc.contrats
+            ):
+                self.select_account(
+                    source_partner.ref_bp, source_cc.numero_cc, source_partner.id_personne
+                )
+                source_postal = source_cc.adresse.cp if source_cc.adresse else ""
+                source_history = self._history_with_fallback(
+                    "GAZ",
+                    ref_bp=source_partner.ref_bp,
+                    compte_contrat=source_cc.numero_cc,
+                    code_postal=source_postal,
+                )
+                for index, contract in enumerate(cc.contrats):
+                    if _energy_kind(contract) == "GAZ":
+                        prices[index] = self._price_for_contract(
+                            contract,
+                            eco={},
+                            estimation_elec={},
+                            estimation_gaz={},
+                            histo={"GAZ": source_history},
+                        )
+                        prices[index].notes = (
+                            prices[index].notes + "; "
+                            "gas meter matched by configured PCE"
+                        ).strip("; ")
+        return prices
 
     def get_snapshot(
         self,
@@ -818,25 +944,42 @@ class EngieClient:
         """Prices, recent daily consumption, invoices, and outstanding balance."""
         if account is None:
             account = self.get_account()
+        gas_source = self._gas_source_for_account(account)
         contracts: list[ContractSnapshot] = []
         billing: list[BillingSnapshot] = []
         for partner in account.partners:
             for cc in partner.comptes_contrat:
-                prices = self._prices_for_compte(partner.ref_bp, partner.id_personne, cc)
+                prices = self._prices_for_compte(
+                    partner.ref_bp, partner.id_personne, cc,
+                    gas_source=gas_source,
+                )
                 code_postal = cc.adresse.cp if cc.adresse else ""
                 kinds = {_energy_kind(contract) for contract in cc.contrats}
                 daily_by_energy: dict[str, list[ConsumptionPoint]] = {}
                 for energy in ("ELEC", "GAZ"):
                     if energy not in kinds:
                         continue
+                    source_partner, source_cc = partner, cc
+                    if energy == "GAZ" and gas_source is not None:
+                        source_partner, source_cc = gas_source
+                    self.select_account(
+                        source_partner.ref_bp,
+                        source_cc.numero_cc,
+                        source_partner.id_personne,
+                    )
+                    source_postal = (
+                        source_cc.adresse.cp if source_cc.adresse else ""
+                    )
                     daily_by_energy[energy] = self.get_consumption_points(
                         energy,
                         granularity="day",
-                        ref_bp=partner.ref_bp,
-                        compte_contrat=cc.numero_cc,
-                        code_postal=code_postal,
+                        ref_bp=source_partner.ref_bp,
+                        compte_contrat=source_cc.numero_cc,
+                        code_postal=source_postal,
                         days=daily_days,
                     )
+                # Restore nominal account context for invoices and balances.
+                self.select_account(partner.ref_bp, cc.numero_cc, partner.id_personne)
                 invoices_payload = self._try_json(
                     lambda ref_bp=partner.ref_bp, numero=cc.numero_cc: self.get_invoices(
                         ref_bp, numero
@@ -979,7 +1122,11 @@ class EngieClient:
             source = source or ("histoElecMois" if energy == "ELEC" else "histoGazMois")
             as_of = as_of or as_of_histo
         if price_ttc is None:
-            notes = notes or "No kWh price available (estimation 403 and empty history)"
+            notes = notes or (
+                "No gas kWh price returned; inspect gas API diagnostics for status and response shape"
+                if energy == "GAZ"
+                else "No electricity kWh price returned"
+            )
 
         return ContractPrice(
             contract_id=contract.id,
@@ -1306,6 +1453,59 @@ class EngieClient:
             demandeur="PARTICULIERS_ANDROID",
         )
 
+    def _record_gas_response(
+        self,
+        path: str,
+        response: httpx.Response,
+        params: dict[str, Any] | None,
+    ) -> None:
+        """Remember *only* technical metadata for the three gas endpoints."""
+        endpoint = path.rsplit("/", 1)[-1]
+        if endpoint not in _GAS_API_ENDPOINTS:
+            return
+
+        summary: dict[str, Any] = {
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "http_status": response.status_code,
+            "content_type": (
+                response.headers.get("content-type") or ""
+            ).split(";", 1)[0][:64],
+        }
+        if params and "communicant" in params:
+            summary["communicant"] = str(params["communicant"]).lower() == "true"
+
+        if not response.content:
+            summary["response_type"] = "empty"
+        else:
+            try:
+                payload = response.json()
+            except ValueError:
+                summary["response_type"] = "invalid_json"
+            else:
+                summary["response_type"] = type(payload).__name__
+                if isinstance(payload, dict):
+                    summary["field_count"] = len(payload)
+                    summary["recognized_fields"] = sorted(
+                        key for key in payload if key in _GAS_SAFE_TOP_LEVEL_FIELDS
+                    )
+                    rows = payload.get("historiquesGaz")
+                    summary["history_field_type"] = (
+                        type(rows).__name__ if "historiquesGaz" in payload
+                        else "absent"
+                    )
+                    if isinstance(rows, list):
+                        summary["history_row_count"] = len(rows)
+                        if rows and isinstance(rows[0], dict):
+                            summary["recognized_row_fields"] = sorted(
+                                key for key in rows[0] if key in _GAS_SAFE_ROW_FIELDS
+                            )
+                    if "data" in payload:
+                        summary["data_field_type"] = type(payload["data"]).__name__
+
+        attempts = self._gas_api_diagnostics.setdefault(endpoint, [])
+        attempts.append(summary)
+        del attempts[:-6]
+
     def _api_json(
         self,
         method: str,
@@ -1348,6 +1548,7 @@ class EngieClient:
         response = self._http_client().request(
             method, url, headers=headers, params=params, json=json
         )
+        self._record_gas_response(path, response, params)
         if response.status_code >= 400:
             body: Any
             try:
